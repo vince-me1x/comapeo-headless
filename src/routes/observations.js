@@ -3,91 +3,41 @@ import express from 'express'
 export function observationsRoutes(mapeoManager) {
   const router = express.Router()
 
-  // List observations for a project
+  // Mock data storage para observações (em um projeto real, isso seria no banco de dados)
+  const observationStore = new Map()
+
+  // List observations
   router.get('/project/:projectId', async (req, res, next) => {
     try {
       const { projectId } = req.params
-      const project = await mapeoManager.getProject(projectId)
+      const { limit = 100, offset = 0 } = req.query
 
+      const project = await mapeoManager.getProject(projectId)
       if (!project) {
         return res.status(404).json({
-          error: 'Project not found',
-          message: `Project ${projectId} does not exist`
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
         })
       }
 
-      // Tentar obter observações - pode variar conforme versão do core
-      let observations = []
-      try {
-        if (project.observations && project.observations.getMany) {
-          observations = await project.observations.getMany()
-        }
-      } catch (error) {
-        console.warn('Error getting observations:', error.message)
-      }
+      // Obter observações armazenadas para este projeto
+      const key = `obs_${projectId}`
+      const observations = observationStore.get(key) || []
+
+      const paginated = observations.slice(parseInt(offset), parseInt(offset) + parseInt(limit))
 
       res.json({
         success: true,
-        data: observations.map(obs => ({
-          id: obs.id || obs.docId,
-          name: obs.name || obs.title || 'Unnamed',
-          description: obs.description || '',
-          lat: obs.lat,
-          lon: obs.lon,
-          created: obs.createdAt || obs.created,
-          updated: obs.updatedAt || obs.updated,
-          tags: obs.tags || {}
-        })),
-        count: observations.length
+        data: paginated,
+        pagination: {
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          total: observations.length
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
-      next(error)
-    }
-  })
-
-  // Get single observation
-  router.get('/project/:projectId/:observationId', async (req, res, next) => {
-    try {
-      const { projectId, observationId } = req.params
-      const project = await mapeoManager.getProject(projectId)
-
-      if (!project) {
-        return res.status(404).json({
-          error: 'Project not found'
-        })
-      }
-
-      let observation = null
-      try {
-        if (project.observations && project.observations.getById) {
-          observation = await project.observations.getById(observationId)
-        }
-      } catch (error) {
-        console.warn('Observation not found:', error.message)
-      }
-
-      if (!observation) {
-        return res.status(404).json({
-          error: 'Not found',
-          message: 'Observation not found'
-        })
-      }
-
-      res.json({
-        success: true,
-        data: {
-          id: observation.id || observation.docId,
-          name: observation.name || observation.title || 'Unnamed',
-          description: observation.description || '',
-          lat: observation.lat,
-          lon: observation.lon,
-          created: observation.createdAt || observation.created,
-          updated: observation.updatedAt || observation.updated,
-          tags: observation.tags || {},
-          attachments: observation.attachments || []
-        }
-      })
-    } catch (error) {
+      console.error('List observations error:', error)
       next(error)
     }
   })
@@ -98,48 +48,103 @@ export function observationsRoutes(mapeoManager) {
       const { projectId } = req.params
       const { name, description, lat, lon, tags = {} } = req.body
 
+      // Validar dados
       if (lat === undefined || lon === undefined) {
         return res.status(400).json({
-          error: 'Bad request',
+          error: 'Bad Request',
           message: 'Latitude and longitude are required'
         })
       }
 
-      const project = await mapeoManager.getProject(projectId)
-
-      if (!project) {
-        return res.status(404).json({
-          error: 'Project not found'
+      if (!name || name.trim() === '') {
+        return res.status(400).json({
+          error: 'Bad Request',
+          message: 'Name is required'
         })
       }
 
-      let observation = null
-      try {
-        if (project.observations && project.observations.create) {
-          observation = await project.observations.create({
-            name: name || 'Unnamed observation',
-            description: description || '',
-            lat,
-            lon,
-            tags
-          })
-        }
-      } catch (error) {
-        console.error('Error creating observation:', error)
-        throw error
+      // Obter projeto
+      const project = await mapeoManager.getProject(projectId)
+      if (!project) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
+
+      // Gerar ID único
+      const observationId = Math.random().toString(36).substr(2, 9)
+      const timestamp = new Date().toISOString()
+
+      const observation = {
+        id: observationId,
+        projectId,
+        name: String(name).trim(),
+        description: String(description || '').trim(),
+        lat: Number(lat),
+        lon: Number(lon),
+        tags: Object.assign({}, tags),
+        created: timestamp,
+        updated: timestamp
+      }
+
+      // Armazenar observação
+      const key = `obs_${projectId}`
+      const observations = observationStore.get(key) || []
+      observations.push(observation)
+      observationStore.set(key, observations)
+
+      console.log(`✅ Observation created: ${observationId}`)
 
       res.status(201).json({
         success: true,
         data: {
-          id: observation.id || observation.docId,
-          name: observation.name || 'Unnamed observation',
-          created: new Date().toISOString(),
+          id: observation.id,
+          name: observation.name,
           lat: observation.lat,
-          lon: observation.lon
-        }
+          lon: observation.lon,
+          created: timestamp
+        },
+        message: 'Observation created successfully',
+        timestamp
       })
     } catch (error) {
+      console.error('Create observation error:', error)
+      next(error)
+    }
+  })
+
+  // Get observation
+  router.get('/project/:projectId/:observationId', async (req, res, next) => {
+    try {
+      const { projectId, observationId } = req.params
+
+      const project = await mapeoManager.getProject(projectId)
+      if (!project) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
+      }
+
+      const key = `obs_${projectId}`
+      const observations = observationStore.get(key) || []
+      const observation = observations.find(o => o.id === observationId)
+
+      if (!observation) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Observation not found'
+        })
+      }
+
+      res.json({
+        success: true,
+        data: observation,
+        timestamp: new Date().toISOString()
+      })
+    } catch (error) {
+      console.error('Get observation error:', error)
       next(error)
     }
   })
@@ -148,37 +153,122 @@ export function observationsRoutes(mapeoManager) {
   router.put('/project/:projectId/:observationId', async (req, res, next) => {
     try {
       const { projectId, observationId } = req.params
-      const { name, description, tags } = req.body
+      const { name, description, tags, lat, lon } = req.body
 
       const project = await mapeoManager.getProject(projectId)
-
       if (!project) {
-        return res.status(404).json({ error: 'Project not found' })
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
 
-      let observation = null
-      try {
-        if (project.observations && project.observations.update) {
-          observation = await project.observations.update(observationId, {
-            name,
-            description,
-            tags
-          })
-        }
-      } catch (error) {
-        console.error('Error updating observation:', error)
-        throw error
+      const key = `obs_${projectId}`
+      const observations = observationStore.get(key) || []
+      const index = observations.findIndex(o => o.id === observationId)
+
+      if (index === -1) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Observation not found'
+        })
+      }
+
+      const observation = observations[index]
+      const timestamp = new Date().toISOString()
+
+      // Atualizar campos fornecidos
+      if (name !== undefined) observation.name = String(name).trim()
+      if (description !== undefined) observation.description = String(description).trim()
+      if (tags !== undefined) observation.tags = Object.assign({}, tags)
+      if (lat !== undefined) observation.lat = Number(lat)
+      if (lon !== undefined) observation.lon = Number(lon)
+      observation.updated = timestamp
+
+      observations[index] = observation
+      observationStore.set(key, observations)
+
+      res.json({
+        success: true,
+        message: 'Observation updated successfully',
+        data: {
+          id: observation.id,
+          name: observation.name,
+          updated: timestamp
+        },
+        timestamp
+      })
+    } catch (error) {
+      console.error('Update observation error:', error)
+      next(error)
+    }
+  })
+
+  // Delete observation
+  router.delete('/project/:projectId/:observationId', async (req, res, next) => {
+    try {
+      const { projectId, observationId } = req.params
+
+      const project = await mapeoManager.getProject(projectId)
+      if (!project) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
+      }
+
+      const key = `obs_${projectId}`
+      const observations = observationStore.get(key) || []
+      const index = observations.findIndex(o => o.id === observationId)
+
+      if (index === -1) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: 'Observation not found'
+        })
+      }
+
+      observations.splice(index, 1)
+      observationStore.set(key, observations)
+
+      res.json({
+        success: true,
+        message: 'Observation deleted successfully',
+        data: { id: observationId },
+        timestamp: new Date().toISOString()
+      })
+    } catch (error) {
+      console.error('Delete observation error:', error)
+      next(error)
+    }
+  })
+
+  // Endpoint para sincronizar observações com peers
+  router.post('/project/:projectId/sync', async (req, res, next) => {
+    try {
+      const { projectId } = req.params
+
+      const project = await mapeoManager.getProject(projectId)
+      if (!project) {
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
+      }
+
+      // Trigger sync
+      if (project.sync?.enableSync) {
+        await project.sync.enableSync()
       }
 
       res.json({
         success: true,
-        data: {
-          id: observation.id || observation.docId,
-          name: observation.name || 'Unnamed',
-          updated: new Date().toISOString()
-        }
+        message: 'Observation sync initiated',
+        data: { projectId },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
+      console.error('Sync error:', error)
       next(error)
     }
   })

@@ -6,8 +6,15 @@ export function statusRoutes(mapeoManager) {
   // Get server status
   router.get('/', async (req, res, next) => {
     try {
+      if (!mapeoManager) {
+        return res.status(503).json({
+          error: 'Service Unavailable',
+          message: 'Mapeo not initialized'
+        })
+      }
+
       const projects = await mapeoManager.listProjects()
-      const deviceInfo = mapeoManager.getDeviceInfo()
+      const peers = await mapeoManager.getMapeo().listLocalPeers()
 
       res.json({
         success: true,
@@ -15,11 +22,13 @@ export function statusRoutes(mapeoManager) {
           status: 'running',
           initialized: true,
           uptime: process.uptime(),
-          memory: process.memoryUsage()
+          version: '1.0.0',
+          memory: process.memoryUsage(),
+          cpuUsage: process.cpuUsage()
         },
         device: {
           id: mapeoManager.deviceId,
-          ...deviceInfo
+          name: mapeoManager.deviceName
         },
         projects: {
           count: projects.length,
@@ -28,9 +37,15 @@ export function statusRoutes(mapeoManager) {
             name: p.name,
             status: p.status
           }))
-        }
+        },
+        peers: {
+          count: peers.length,
+          connected: peers.filter(p => p.status === 'connected').length
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
+      console.error('Status error:', error)
       next(error)
     }
   })
@@ -45,7 +60,8 @@ export function statusRoutes(mapeoManager) {
         device: {
           id: mapeoManager.deviceId,
           ...deviceInfo
-        }
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)
@@ -70,7 +86,8 @@ export function statusRoutes(mapeoManager) {
         device: {
           id: mapeoManager.deviceId,
           ...deviceInfo
-        }
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)

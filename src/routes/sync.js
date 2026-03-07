@@ -10,12 +10,15 @@ export function syncRoutes(mapeoManager) {
       const project = await mapeoManager.getProject(projectId)
 
       if (!project) {
-        return res.status(404).json({ error: 'Project not found' })
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
 
       let syncState = {}
       try {
-        if (project.sync && project.sync.getState) {
+        if (project.sync?.getState) {
           syncState = project.sync.getState()
         }
       } catch (error) {
@@ -26,28 +29,39 @@ export function syncRoutes(mapeoManager) {
         success: true,
         data: {
           projectId,
-          initialSync: syncState.initial || { isSyncEnabled: false },
-          dataSync: syncState.data || { isSyncEnabled: false },
-          remotePeers: Object.keys(syncState.remoteDeviceSyncState || {})
-        }
+          initialSync: {
+            enabled: syncState.initial?.isSyncEnabled || false,
+            progress: syncState.initial?.progress || 0
+          },
+          dataSync: {
+            enabled: syncState.data?.isSyncEnabled || false,
+            progress: syncState.data?.progress || 0
+          },
+          remotePeers: Object.keys(syncState.remoteDeviceSyncState || {}),
+          lastSyncTime: syncState.lastSyncTime || null
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)
     }
   })
 
-  // Start/enable sync
+  // Enable sync
   router.post('/:projectId/enable', async (req, res, next) => {
     try {
       const { projectId } = req.params
       const project = await mapeoManager.getProject(projectId)
 
       if (!project) {
-        return res.status(404).json({ error: 'Project not found' })
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
 
       try {
-        if (project.sync && project.sync.enableSync) {
+        if (project.sync?.enableSync) {
           await project.sync.enableSync()
         }
       } catch (error) {
@@ -60,25 +74,29 @@ export function syncRoutes(mapeoManager) {
         data: {
           projectId,
           syncEnabled: true
-        }
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)
     }
   })
 
-  // Stop/disable sync
+  // Disable sync
   router.post('/:projectId/disable', async (req, res, next) => {
     try {
       const { projectId } = req.params
       const project = await mapeoManager.getProject(projectId)
 
       if (!project) {
-        return res.status(404).json({ error: 'Project not found' })
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
 
       try {
-        if (project.sync && project.sync.disableSync) {
+        if (project.sync?.disableSync) {
           await project.sync.disableSync()
         }
       } catch (error) {
@@ -91,36 +109,37 @@ export function syncRoutes(mapeoManager) {
         data: {
           projectId,
           syncEnabled: false
-        }
+        },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)
     }
   })
 
-  // Wait for sync to complete
+  // Wait for sync
   router.post('/:projectId/wait', async (req, res, next) => {
     try {
       const { projectId } = req.params
-      const { timeout = 30000 } = req.body
+      const { timeout = 30000, type = 'data' } = req.body
 
       const project = await mapeoManager.getProject(projectId)
 
       if (!project) {
-        return res.status(404).json({ error: 'Project not found' })
+        return res.status(404).json({
+          error: 'Not Found',
+          message: `Project ${projectId} not found`
+        })
       }
 
       const syncPromise = new Promise((resolve) => {
         const checkSync = () => {
           try {
-            if (project.sync && project.sync.getState) {
+            if (project.sync?.getState) {
               const state = project.sync.getState()
-              if (
-                state.initial &&
-                state.initial.isSyncEnabled === false &&
-                state.data &&
-                state.data.isSyncEnabled === false
-              ) {
+              const targetSync = type === 'initial' ? state.initial : state.data
+
+              if (targetSync && !targetSync.isSyncEnabled) {
                 resolve('sync complete')
                 return
               }
@@ -143,7 +162,8 @@ export function syncRoutes(mapeoManager) {
       res.json({
         success: true,
         message: result,
-        data: { projectId }
+        data: { projectId, type },
+        timestamp: new Date().toISOString()
       })
     } catch (error) {
       next(error)
