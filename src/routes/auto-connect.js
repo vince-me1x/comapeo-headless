@@ -3,7 +3,6 @@ import express from 'express'
 export function autoConnectRoutes(mapeoManager) {
   const router = express.Router()
 
-  // Try to connect to a known deviceId (e.g., invitorDeviceId from invite)
   router.post('/connect', async (req, res, next) => {
     try {
       const { deviceId } = req.body || {}
@@ -21,13 +20,25 @@ export function autoConnectRoutes(mapeoManager) {
         })
       }
 
-      const result = await connectFn.call(core, { deviceId })
-      const peers = (typeof core.listLocalPeers === 'function') ? await core.listLocalPeers() : null
+      let result
+      try {
+        result = await connectFn.call(core, { deviceId })
+      } catch (e1) {
+        // fallback: some APIs accept a string
+        result = await connectFn.call(core, deviceId)
+      }
+
+      let peers = null
+      try {
+        peers = typeof core?.listLocalPeers === 'function' ? await core.listLocalPeers() : null
+      } catch (e) {
+        peers = { error: e?.message || String(e) }
+      }
 
       res.json({
         success: true,
         message: 'Connect attempted',
-        data: { result, peers },
+        data: { deviceId, result, peers },
         timestamp: new Date().toISOString()
       })
     } catch (e) {
