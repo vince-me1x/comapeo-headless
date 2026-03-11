@@ -13,6 +13,7 @@ import { membersRoutes } from './routes/members.js'
 import { blobsRoutes } from './routes/blobs.js'
 import { invitesRoutes } from './routes/invites.js'
 import { autoConnectRoutes } from './routes/auto-connect.js'
+import { debugRoutes } from './routes/debug.js'
 import { debugSyncRoutes } from './routes/debug-sync.js'
 
 
@@ -318,29 +319,33 @@ function mountApiRoutes(manager) {
   app.use('/api/members', checkMapeoInitialized, membersRoutes(manager))
   app.use('/api/blobs', checkMapeoInitialized, blobsRoutes(manager))
   app.use('/api/invites', checkMapeoInitialized, invitesRoutes(manager))
-  app.use('/api/auto-connect', checkMapeoInitialized, autoConnectRoutes(manager))  
+  app.use('/api/auto-connect', checkMapeoInitialized, autoConnectRoutes(manager))
+  app.use('/api/debug', checkMapeoInitialized, debugRoutes(manager))
   app.use('/api/debug-sync', checkMapeoInitialized, debugSyncRoutes(manager))
+
+
+  // Error handling middleware
+  app.use((err, req, res, next) => {
+      console.error('Error:', err?.message || err)
+      res.status(err?.status || 500).json({
+	  error: err?.error || 'Internal Server Error',
+	  message: err?.message || String(err),
+	  timestamp: new Date().toISOString(),
+	  details: process.env.NODE_ENV === 'development' ? err?.stack : undefined
+      })
+  })
+
+  // 404 handler
+  app.use((req, res) => {
+      res.status(404).json({
+	  error: 'Not Found',
+	  message: `Route ${req.method} ${req.path} not found`,
+	  timestamp: new Date().toISOString()
+      })
+  })
+    
 }
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Error:', err?.message || err)
-  res.status(err?.status || 500).json({
-    error: err?.error || 'Internal Server Error',
-    message: err?.message || String(err),
-    timestamp: new Date().toISOString(),
-    details: process.env.NODE_ENV === 'development' ? err?.stack : undefined
-  })
-})
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not Found',
-    message: `Route ${req.method} ${req.path} not found`,
-    timestamp: new Date().toISOString()
-  })
-})
 
 // Initialize and start server
 async function start() {
