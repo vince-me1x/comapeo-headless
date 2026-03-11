@@ -19,6 +19,10 @@ const INVITE_DEBUG_LOG = '/tmp/comapeo-invite-debug.log'
 // TTL (ms) to keep an invite marked as processed before allowing re-processing
 const PROCESSED_INVITE_TTL = 10 * 60 * 1000 // 10 minutes
 
+// How long to keep retrying enableSync after joining a project
+const ENABLE_SYNC_RETRY_TTL = 3 * 60 * 1000 // 3 minutes
+const ENABLE_SYNC_RETRY_INTERVAL = 1000 // 1 second
+
 export class MapeoManager {
   constructor(dataDir, deviceName = 'CoMapeoHeadlessServer') {
     this.dataDir = dataDir
@@ -39,6 +43,9 @@ export class MapeoManager {
     this._invitePollIntervalMs = 5000
     this._invitePollHandle = null
     this._stopping = false
+
+    // projectId -> timeoutHandle (avoid duplicate retry loops)
+    this._enableSyncJobs = new Map()
   }
 
   async _appendDebugLog(prefix, obj) {
@@ -160,44 +167,83 @@ export class MapeoManager {
     return null
   }
 
-  async _waitForProjectReady(projectId, { timeout = 15000, interval = 500 } = {}) {
+  async _waitForProjectExists(projectId, { timeout = 60000, interval = 500 } = {}) {
     const start = Date.now()
     while (Date.now() - start < timeout) {
       try {
         const project = await this.mapeo.getProject(projectId)
-        if (project && project.sync && typeof project.sync.enableSync === 'function') {
-          return project
-        }
+        if (project) return project
       } catch (e) {}
       await new Promise((r) => setTimeout(r, interval))
     }
     return null
   }
 
-  async _enableProjectSyncWithRetry(project, { timeout = 15000, interval = 500 } = {}) {
-    if (!project || !project.sync) return
+  async _enableProjectSyncWithRetry(project, { timeout = 20000, interval = 500 } = {}) {
+    if (!project) return false
+
     const start = Date.now()
-    try {
-      if (typeof project.sync.enableSync === 'function') {
-        await project.sync.enableSync()
-      }
-    } catch (e) {
-      console.warn('project.sync.enableSync threw:', e?.message || e)
-    }
+
+    // Try enableSync (may throw until sync API ready)
     while (Date.now() - start < timeout) {
       try {
-        if (typeof project.sync.getState === 'function') {
+        if (project?.sync && typeof project.sync.enableSync === 'function') {
+          await project.sync.enableSync().catch(() => {})
+        }
+        if (project?.sync && typeof project.sync.getState === 'function') {
           const state = project.sync.getState()
           if (state?.data && state.data.isSyncEnabled) {
             console.log(`🔁 Data sync active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
             return true
           }
+          // Sometimes initial sync is what starts first
+          if (state?.initial && state.initial.isSyncEnabled) {
+            console.log(`🔁 Initial sync active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
+            return true
+          }
         }
-      } catch (e) {}
+      } catch (e) {
+        // swallow and retry
+      }
       await new Promise((r) => setTimeout(r, interval))
     }
-    console.warn(`⚠️ Timeout waiting for data sync to become active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
+
+    console.warn(`⚠️ Timeout waiting for sync to become active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
     return false
+  }
+
+  _scheduleEnableSync(projectId) {
+    if (!projectId) return
+    if (this._enableSyncJobs.has(projectId)) return
+
+    const startedAt = Date.now()
+    console.log('🧵 Scheduling background enableSync for project', projectId)
+
+    const handle = setInterval(async () => {
+      if (this._stopping) return
+      if (Date.now() - startedAt > ENABLE_SYNC_RETRY_TTL) {
+        clearInterval(handle)
+        this._enableSyncJobs.delete(projectId)
+        console.warn('🧵 enableSync background job TTL expired for project', projectId)
+        return
+      }
+
+      try {
+        const project = await this.mapeo.getProject(projectId)
+        if (!project) return
+
+        const ok = await this._enableProjectSyncWithRetry(project, { timeout: 3000, interval: 300 })
+        if (ok) {
+          clearInterval(handle)
+          this._enableSyncJobs.delete(projectId)
+          console.log('✅ Background enableSync done for project', projectId)
+        }
+      } catch (e) {
+        // keep trying
+      }
+    }, ENABLE_SYNC_RETRY_INTERVAL)
+
+    this._enableSyncJobs.set(projectId, handle)
   }
 
   async _handleInvite(invite) {
@@ -245,17 +291,16 @@ export class MapeoManager {
         return
       }
 
+      // Critical fix: don't require project.sync to exist immediately.
+      // Wait for project to exist, then schedule background enableSync retries.
       try {
-        const project = await this._waitForProjectReady(projectId, { timeout: 20000 })
-        if (project) {
-          await this._enableProjectSyncWithRetry(project, { timeout: 20000 })
-        } else {
-          console.warn('Project not ready after accept, could not enable sync:', projectId)
-          await this._appendDebugLog('SYNC_NOT_READY', { projectId }).catch(() => {})
+        const project = await this._waitForProjectExists(projectId, { timeout: 60000, interval: 500 })
+        if (!project) {
+          console.warn('Project still not available after accept (will retry in background):', projectId)
         }
+        this._scheduleEnableSync(projectId)
       } catch (e) {
-        console.warn('Error enabling sync after accepting invite:', e?.message || e)
-        await this._appendDebugLog('SYNC_ERROR', { projectId, error: util.inspect(e, { depth: 1 }) }).catch(() => {})
+        console.warn('Error scheduling enableSync after accepting invite:', e?.message || e)
       }
     } catch (e) {
       console.warn('Error in _handleInvite:', e?.message || e)
@@ -299,11 +344,6 @@ export class MapeoManager {
       this._invitePollHandle = null
       console.log('Invite poller stopped')
     }
-  }
-
-  async _ensureProjectSyncEnabled(project) {
-    if (!project) return
-    await this._enableProjectSyncWithRetry(project, { timeout: 15000 })
   }
 
   async initialize() {
@@ -401,16 +441,12 @@ export class MapeoManager {
         console.warn('Invite auto-accept setup failed:', e?.message || e)
       }
 
+      // On startup, also schedule sync enable for any existing projects
       try {
         if (this.mapeo && typeof this.mapeo.listProjects === 'function') {
           const projectIds = await this.mapeo.listProjects()
           for (const pid of projectIds) {
-            try {
-              const project = await this.mapeo.getProject(pid)
-              await this._ensureProjectSyncEnabled(project)
-            } catch (e) {
-              console.warn('Failed to auto-enable sync for project', pid, e?.message || e)
-            }
+            this._scheduleEnableSync(pid)
           }
         }
       } catch (e) {
@@ -536,6 +572,12 @@ export class MapeoManager {
   async close() {
     this._stopping = true
     this._stopInvitePoller()
+
+    // stop enableSync jobs
+    for (const handle of this._enableSyncJobs.values()) {
+      try { clearInterval(handle) } catch {}
+    }
+    this._enableSyncJobs.clear()
 
     if (this.mapeo) {
       this.projects.clear()

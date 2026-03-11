@@ -12,6 +12,9 @@ import { peersRoutes } from './routes/peers.js'
 import { membersRoutes } from './routes/members.js'
 import { blobsRoutes } from './routes/blobs.js'
 import { invitesRoutes } from './routes/invites.js'
+import { autoConnectRoutes } from './routes/auto-connect.js'
+import { debugSyncRoutes } from './routes/debug-sync.js'
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
@@ -256,6 +259,8 @@ function mountApiRoutes(manager) {
   app.use('/api/members', checkMapeoInitialized, membersRoutes(manager))
   app.use('/api/blobs', checkMapeoInitialized, blobsRoutes(manager))
   app.use('/api/invites', checkMapeoInitialized, invitesRoutes(manager))
+  app.use('/api/auto-connect', checkMapeoInitialized, autoConnectRoutes(manager))  
+  app.use('/api/debug-sync', checkMapeoInitialized, debugSyncRoutes(manager))
 }
 
 // Error handling middleware
