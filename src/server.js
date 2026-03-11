@@ -144,6 +144,38 @@ app.get('/api/docs', (req, res) => {
   })
 })
 
+
+app.get('/__whoami', (req, res) => {
+  res.json({
+    ok: true,
+    cwd: process.cwd(),
+    file: import.meta.url,
+    node: process.version,
+    time: new Date().toISOString()
+  })
+})
+
+// Lista as rotas que o Express conhece (debug)
+app.get('/__routes', (req, res) => {
+  try {
+    const routes = []
+    const stack = app?._router?.stack || []
+    for (const layer of stack) {
+      if (layer?.route?.path) {
+        const methods = Object.keys(layer.route.methods || {}).filter((m) => layer.route.methods[m])
+        routes.push({ path: layer.route.path, methods })
+      } else if (layer?.name === 'router' && layer?.handle?.stack) {
+        // mounted routers: show mount path if available
+        routes.push({ mounted: true, name: layer.name })
+      }
+    }
+    res.json({ ok: true, routes })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) })
+  }
+})
+
+
 // --- Inline debug routes (robust) ---
 // raw invites (existing)
 app.get('/api/debug/invites', async (req, res) => {
