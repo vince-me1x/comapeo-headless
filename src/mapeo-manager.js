@@ -1,7 +1,10 @@
+/* UPDATED: processed-invites with TTL to avoid stale caching that prevented re-accepting re-sent invites */
+import util from 'util'
 import { randomBytes } from 'crypto'
 import path from 'path'
+import os from 'os'
 import { fileURLToPath } from 'url'
-import { mkdir, readFile, writeFile } from 'fs/promises'
+import { mkdir, readFile, writeFile, appendFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { MapeoManager as ComapeoMapeoManager } from '@comapeo/core'
 import { createRequire } from 'module'
@@ -11,6 +14,10 @@ const require = createRequire(import.meta.url)
 
 const ROOT_KEY_FILE = 'root-key.hex'
 const DEVICE_NAME_FILE = 'device-info.json'
+const INVITE_DEBUG_LOG = '/tmp/comapeo-invite-debug.log'
+
+// TTL (ms) to keep an invite marked as processed before allowing re-processing
+const PROCESSED_INVITE_TTL = 10 * 60 * 1000 // 10 minutes
 
 export class MapeoManager {
   constructor(dataDir, deviceName = 'CoMapeoHeadlessServer') {
@@ -20,12 +27,53 @@ export class MapeoManager {
     this.projects = new Map()
     this.rootKeyPath = path.join(dataDir, ROOT_KEY_FILE)
     this.deviceInfoPath = path.join(dataDir, DEVICE_NAME_FILE)
+
+    this._fastifyInstance = null
+    this._fastifyAddress = null
+    this._fastifyListening = false
+
+    // processedInvites: Map<inviteId, timestamp>
+    // we expire entries after PROCESSED_INVITE_TTL so re-sent invites can be retried
+    this._processedInvites = new Map()
+
+    this._invitePollIntervalMs = 5000
+    this._invitePollHandle = null
+    this._stopping = false
   }
 
-  /**
-   * Gera ou carrega a rootKey persisted
-   * @returns {Buffer} 16 bytes de random data para identificar o device
-   */
+  async _appendDebugLog(prefix, obj) {
+    try {
+      const s = `${new Date().toISOString()} ${prefix}\n${util.inspect(obj, { depth: null })}\n\n`
+      await appendFile(INVITE_DEBUG_LOG, s).catch(() => {})
+    } catch {}
+  }
+
+  _dumpInvite(invite) {
+    try {
+      console.log('INVITE DUMP:', util.inspect(invite, { depth: null }))
+    } catch (e) {
+      console.log('INVITE DUMP fallback:', String(invite))
+    }
+    this._appendDebugLog('INVITE', invite).catch(() => {})
+  }
+
+  _isInviteRecentlyProcessed(inviteId) {
+    const ts = this._processedInvites.get(inviteId)
+    if (!ts) return false
+    if (Date.now() - ts > PROCESSED_INVITE_TTL) {
+      // expired: remove entry and allow re-processing
+      this._processedInvites.delete(inviteId)
+      return false
+    }
+    return true
+  }
+
+  _markInviteProcessed(inviteId) {
+    try {
+      this._processedInvites.set(inviteId, Date.now())
+    } catch {}
+  }
+
   async getOrCreateRootKey() {
     if (existsSync(this.rootKeyPath)) {
       try {
@@ -36,17 +84,12 @@ export class MapeoManager {
         console.warn('Failed to load root key, generating new one:', error.message)
       }
     }
-
-    // Gerar nova rootKey (16 bytes)
     const newRootKey = randomBytes(16)
     await writeFile(this.rootKeyPath, newRootKey.toString('hex'), 'utf-8')
     console.log('✅ Generated and saved new root key')
     return newRootKey
   }
 
-  /**
-   * Gera ou carrega informações do dispositivo
-   */
   async getOrCreateDeviceInfo() {
     if (existsSync(this.deviceInfoPath)) {
       try {
@@ -58,42 +101,227 @@ export class MapeoManager {
         console.warn('Failed to load device info, creating new one:', error.message)
       }
     }
-
     const deviceInfo = {
       name: this.deviceName,
       createdAt: new Date().toISOString(),
       version: '1.0.0',
     }
-
     await writeFile(this.deviceInfoPath, JSON.stringify(deviceInfo, null, 2), 'utf-8')
     console.log('✅ Generated and saved device info')
     return deviceInfo
   }
 
+  _findLocalIPv4() {
+    const nets = os.networkInterfaces()
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name]) {
+        if (net.family === 'IPv4' && !net.internal) {
+          return net.address
+        }
+      }
+    }
+    return null
+  }
+
+  _formatServerAddress(server) {
+    try {
+      const address = server.address()
+      if (!address) return null
+      if (typeof address === 'string') return address
+      let host = address.address
+      const port = address.port
+      if (!host) return null
+      if (host === '0.0.0.0' || host === '::') {
+        const localIp = this._findLocalIPv4()
+        if (localIp) host = localIp
+        else host = '0.0.0.0'
+      }
+      if (host.indexOf(':') !== -1 && host[0] !== '[') {
+        return `http://[${host}]:${port}`
+      } else {
+        return `http://${host}:${port}`
+      }
+    } catch (e) {
+      return null
+    }
+  }
+
+  async _waitForInviteApi({ timeout = 10000, interval = 500 } = {}) {
+    const start = Date.now()
+    while (Date.now() - start < timeout) {
+      try {
+        const core = this.mapeo
+        if (core && core.invite && typeof core.invite.getMany === 'function' && typeof core.invite.on === 'function') {
+          return core.invite
+        }
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, interval))
+    }
+    return null
+  }
+
+  async _waitForProjectReady(projectId, { timeout = 15000, interval = 500 } = {}) {
+    const start = Date.now()
+    while (Date.now() - start < timeout) {
+      try {
+        const project = await this.mapeo.getProject(projectId)
+        if (project && project.sync && typeof project.sync.enableSync === 'function') {
+          return project
+        }
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, interval))
+    }
+    return null
+  }
+
+  async _enableProjectSyncWithRetry(project, { timeout = 15000, interval = 500 } = {}) {
+    if (!project || !project.sync) return
+    const start = Date.now()
+    try {
+      if (typeof project.sync.enableSync === 'function') {
+        await project.sync.enableSync()
+      }
+    } catch (e) {
+      console.warn('project.sync.enableSync threw:', e?.message || e)
+    }
+    while (Date.now() - start < timeout) {
+      try {
+        if (typeof project.sync.getState === 'function') {
+          const state = project.sync.getState()
+          if (state?.data && state.data.isSyncEnabled) {
+            console.log(`🔁 Data sync active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
+            return true
+          }
+        }
+      } catch (e) {}
+      await new Promise((r) => setTimeout(r, interval))
+    }
+    console.warn(`⚠️ Timeout waiting for data sync to become active for project ${project.projectPublicId || project.projectId || '(unknown)'}`)
+    return false
+  }
+
+  async _handleInvite(invite) {
+    try {
+      if (!invite || !invite.inviteId) return
+      const inviteId = invite.inviteId
+
+      // check recent processed cache with TTL
+      if (this._isInviteRecentlyProcessed(inviteId)) {
+        console.log('Skipping invite (recently processed):', inviteId)
+        await this._appendDebugLog('SKIP_RECENT', { inviteId }).catch(() => {})
+        return
+      }
+
+      // only accept when pending
+      if (invite.state !== 'pending') {
+        // mark as processed (final state) so we don't retry repeatedly
+        this._markInviteProcessed(inviteId)
+        await this._appendDebugLog('SKIP_NON_PENDING', { inviteId, state: invite.state }).catch(() => {})
+        return
+      }
+
+      const core = this.mapeo
+      if (!core || !core.invite || typeof core.invite.accept !== 'function') {
+        console.warn('Invite API not available to accept invite', inviteId)
+        await this._appendDebugLog('ACCEPT_FAIL_NO_API', invite).catch(() => {})
+        return
+      }
+
+      // Dump invite for debug
+      this._dumpInvite(invite)
+      await this._appendDebugLog('ATTEMPT_ACCEPT', invite).catch(() => {})
+
+      let projectId
+      try {
+        projectId = await core.invite.accept(invite)
+        console.log(`✅ Auto-accepted invite ${inviteId} -> project ${projectId}`)
+        // mark processed only after successful accept
+        this._markInviteProcessed(inviteId)
+        await this._appendDebugLog('ACCEPT_SUCCESS', { inviteId, projectId }).catch(() => {})
+      } catch (e) {
+        // do NOT mark processed on transient error - allow retries
+        console.warn('Invite accept failed for', inviteId, e?.message || e)
+        await this._appendDebugLog('ACCEPT_ERROR', { invite, error: util.inspect(e, { depth: 2 }) }).catch(() => {})
+        return
+      }
+
+      try {
+        const project = await this._waitForProjectReady(projectId, { timeout: 20000 })
+        if (project) {
+          await this._enableProjectSyncWithRetry(project, { timeout: 20000 })
+        } else {
+          console.warn('Project not ready after accept, could not enable sync:', projectId)
+          await this._appendDebugLog('SYNC_NOT_READY', { projectId }).catch(() => {})
+        }
+      } catch (e) {
+        console.warn('Error enabling sync after accepting invite:', e?.message || e)
+        await this._appendDebugLog('SYNC_ERROR', { projectId, error: util.inspect(e, { depth: 1 }) }).catch(() => {})
+      }
+    } catch (e) {
+      console.warn('Error in _handleInvite:', e?.message || e)
+      await this._appendDebugLog('HANDLE_INVITE_ERROR', { error: util.inspect(e, { depth: 2 }) }).catch(() => {})
+    }
+  }
+
+  _startInvitePoller() {
+    if (this._invitePollHandle) return
+    this._invitePollHandle = setInterval(async () => {
+      if (this._stopping) return
+      try {
+        const core = this.mapeo
+        if (!core || !core.invite || typeof core.invite.getMany !== 'function') return
+        const invites = core.invite.getMany() || []
+        if (invites.length === 0) {
+          await this._appendDebugLog('POLL_HEARTBEAT', { timestamp: Date.now(), count: 0 }).catch(() => {})
+          return
+        }
+        console.log(`Invite poller: found ${invites.length} invites`)
+        await this._appendDebugLog('POLL_FOUND', invites).catch(() => {})
+        for (const inv of invites) {
+          try {
+            this._dumpInvite(inv)
+            await this._handleInvite(inv)
+          } catch (e) {
+            console.warn('Invite poller error handling invite', inv?.inviteId, e?.message || e)
+            await this._appendDebugLog('POLL_HANDLE_ERROR', { invite: inv, error: util.inspect(e, { depth: 1 }) }).catch(() => {})
+          }
+        }
+      } catch (e) {
+        console.warn('Invite poller error:', e?.message || e)
+      }
+    }, this._invitePollIntervalMs)
+    console.log('Invite poller started (every', this._invitePollIntervalMs, 'ms)')
+  }
+
+  _stopInvitePoller() {
+    if (this._invitePollHandle) {
+      clearInterval(this._invitePollHandle)
+      this._invitePollHandle = null
+      console.log('Invite poller stopped')
+    }
+  }
+
+  async _ensureProjectSyncEnabled(project) {
+    if (!project) return
+    await this._enableProjectSyncWithRetry(project, { timeout: 15000 })
+  }
+
   async initialize() {
     console.log('🔧 Initializing CoMapeo Headless Server...')
     console.log(`📁 Data directory: ${this.dataDir}`)
-
-    // Criar diretório base
     await mkdir(this.dataDir, { recursive: true })
 
-    // Obter ou criar rootKey
     const rootKey = await this.getOrCreateRootKey()
     console.log(`🔑 Device ID: ${rootKey.toString('hex').slice(0, 16)}...`)
 
-    // Obter ou criar device info
     const deviceInfo = await this.getOrCreateDeviceInfo()
     console.log(`🖥️  Device Name: ${deviceInfo.name}`)
 
-    // Pastas necessárias
     const dbFolder = path.join(this.dataDir, 'databases')
     const coreStorage = path.join(this.dataDir, 'cores')
-
-    // Criar pastas
     await mkdir(dbFolder, { recursive: true })
     await mkdir(coreStorage, { recursive: true })
 
-    // Pasta de migrações do @comapeo/core
     const corePackagePath = require.resolve('@comapeo/core/package.json')
     const corePath = path.dirname(corePackagePath)
     const clientMigrationsFolder = path.join(corePath, 'drizzle', 'client')
@@ -102,11 +330,14 @@ export class MapeoManager {
     console.log('📦 Loading migration schemas...')
 
     try {
-      // Criar instância do Fastify (obrigatório)
       const { default: fastify } = await import('fastify')
       const fastifyInstance = fastify({ logger: false })
 
-      // Inicializar MapeoManager
+      this._fastifyInstance = fastifyInstance
+      this._fastifyListening = false
+      this._fastifyAddress = null
+      this._stopping = false
+
       this.mapeo = new ComapeoMapeoManager({
         rootKey,
         dbFolder,
@@ -116,12 +347,98 @@ export class MapeoManager {
         fastify: fastifyInstance,
       })
 
+      try {
+        const inviteApi = await this._waitForInviteApi({ timeout: 15000, interval: 500 })
+        if (inviteApi) {
+          console.log('Invite API ready — processing existing invites and attaching listeners')
+          try {
+            const existingInvites = typeof inviteApi.getMany === 'function' ? inviteApi.getMany() : []
+            console.log(`Found ${existingInvites.length} existing invites`)
+            await this._appendDebugLog('EXISTING_INVITES', existingInvites).catch(() => {})
+            for (const inv of existingInvites) {
+              try {
+                this._dumpInvite(inv)
+                await this._handleInvite(inv)
+              } catch (e) {
+                console.warn('Failed to handle existing invite', inv?.inviteId, e?.message || e)
+                await this._appendDebugLog('EXISTING_HANDLE_ERROR', { invite: inv, error: util.inspect(e, { depth: 1 }) }).catch(() => {})
+              }
+            }
+          } catch (e) {
+            console.warn('Error while processing existing invites:', e?.message || e)
+          }
+
+          try {
+            inviteApi.on('invite-received', async (invite) => {
+              console.log('Event: invite-received', invite?.inviteId)
+              this._dumpInvite(invite)
+              await this._appendDebugLog('EVENT_INVITE_RECEIVED', invite).catch(() => {})
+              await this._handleInvite(invite).catch((e) => {
+                console.warn('Error handling invite-received', e?.message || e)
+              })
+            })
+            inviteApi.on('invite-updated', async (invite) => {
+              console.log('Event: invite-updated', invite?.inviteId, 'state=', invite?.state)
+              this._dumpInvite(invite)
+              await this._appendDebugLog('EVENT_INVITE_UPDATED', invite).catch(() => {})
+              if (invite && invite.state === 'pending') {
+                await this._handleInvite(invite).catch((e) => {
+                  console.warn('Error handling invite-updated', e?.message || e)
+                })
+              }
+            })
+            console.log('Invite listeners attached')
+          } catch (e) {
+            console.warn('Error attaching invite listeners:', e?.message || e)
+          }
+
+          this._startInvitePoller()
+        } else {
+          console.warn('Invite API not available within timeout; invite auto-accept disabled for this run')
+          await this._appendDebugLog('INVITE_API_TIMEOUT', { timeout: 15000 }).catch(() => {})
+        }
+      } catch (e) {
+        console.warn('Invite auto-accept setup failed:', e?.message || e)
+      }
+
+      try {
+        if (this.mapeo && typeof this.mapeo.listProjects === 'function') {
+          const projectIds = await this.mapeo.listProjects()
+          for (const pid of projectIds) {
+            try {
+              const project = await this.mapeo.getProject(pid)
+              await this._ensureProjectSyncEnabled(project)
+            } catch (e) {
+              console.warn('Failed to auto-enable sync for project', pid, e?.message || e)
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to iterate existing projects to enable sync:', e?.message || e)
+      }
+
+      try {
+        const listenOptions = { port: 0, host: '0.0.0.0' }
+        await fastifyInstance.listen(listenOptions)
+        this._fastifyListening = true
+        const addr = this._formatServerAddress(fastifyInstance.server)
+        this._fastifyAddress = addr
+        console.log('✅ Fastify started for @comapeo/core at', addr)
+      } catch (e) {
+        console.warn('⚠️ Fastify could not be started (core HTTP endpoints may be unavailable):', e?.message || e)
+      }
+
       console.log('✅ CoMapeo initialized successfully')
       console.log('📋 Configuration:')
       console.log(`   - Root Key (stored): ${this.rootKeyPath}`)
       console.log(`   - Database Folder: ${dbFolder}`)
       console.log(`   - Core Storage: ${coreStorage}`)
       console.log(`   - Migrations: ${projectMigrationsFolder}`)
+      if (this._fastifyAddress) {
+        console.log(`   - Core HTTP base: ${this._fastifyAddress}`)
+      } else {
+        console.log('   - Core HTTP base: (not listening)')
+      }
 
       return {
         success: true,
@@ -153,11 +470,7 @@ export class MapeoManager {
     if (!this.mapeo) {
       throw new Error('Mapeo not initialized')
     }
-
-    if (this.projects.has(projectId)) {
-      return this.projects.get(projectId)
-    }
-
+    if (this.projects.has(projectId)) return this.projects.get(projectId)
     try {
       const project = await this.mapeo.getProject(projectId)
       this.projects.set(projectId, project)
@@ -172,7 +485,6 @@ export class MapeoManager {
     if (!this.mapeo) {
       throw new Error('Mapeo not initialized')
     }
-
     try {
       return await this.mapeo.listProjects()
     } catch (error) {
@@ -185,7 +497,6 @@ export class MapeoManager {
     if (!this.mapeo) {
       throw new Error('Mapeo not initialized')
     }
-
     try {
       const projectId = await this.mapeo.createProject({
         name: options.name || 'New Project',
@@ -203,7 +514,6 @@ export class MapeoManager {
     if (!this.mapeo) {
       throw new Error('Mapeo not initialized')
     }
-
     try {
       await this.mapeo.setDeviceInfo({
         name: deviceInfo.name || this.deviceName,
@@ -224,6 +534,9 @@ export class MapeoManager {
   }
 
   async close() {
+    this._stopping = true
+    this._stopInvitePoller()
+
     if (this.mapeo) {
       this.projects.clear()
       try {
@@ -231,6 +544,24 @@ export class MapeoManager {
         console.log('✅ Mapeo closed successfully')
       } catch (error) {
         console.error('Error closing Mapeo:', error.message)
+      }
+    }
+
+    if (this._fastifyInstance) {
+      try {
+        if (this._fastifyListening) {
+          await this._fastifyInstance.close()
+          console.log('✅ Fastify closed successfully')
+        } else {
+          await this._fastifyInstance.close()
+          console.log('✅ Fastify instance closed (was not listening)')
+        }
+      } catch (error) {
+        console.error('Error closing Fastify:', error?.message || error)
+      } finally {
+        this._fastifyInstance = null
+        this._fastifyAddress = null
+        this._fastifyListening = false
       }
     }
   }

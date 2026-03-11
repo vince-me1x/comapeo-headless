@@ -34,10 +34,95 @@ app.use((req, res, next) => {
   next()
 })
 
-// Initialize Mapeo Manager
-let mapeoManager
+// Initialize Mapeo Manager (populado após initialize)
+let mapeoManager = null
 
-// Health check endpoint
+// discovery responder/service handles (for graceful shutdown)
+let _discoveryResponder = null
+let _discoveryService = null
+let _lastDiscoveryInfo = null
+
+// Start peer discovery and advertise via ciao/@homebridge/ciao
+async function startPeerDiscoveryAndAdvertise(wrapperManager) {
+  try {
+    const coreManager = wrapperManager.getMapeo()
+    if (!coreManager || typeof coreManager.startLocalPeerDiscoveryServer !== 'function') {
+      throw new Error('core manager does not expose startLocalPeerDiscoveryServer')
+    }
+
+    const { name, port } = await coreManager.startLocalPeerDiscoveryServer()
+    console.log('Started LocalDiscovery server', { name, port })
+    _lastDiscoveryInfo = { name, port }
+
+    // dynamic import of ciao package, try both package names for compatibility
+    let ciaoModule
+    try {
+      ciaoModule = await import('ciao')
+    } catch (e1) {
+      try {
+        ciaoModule = await import('@homebridge/ciao')
+      } catch (e2) {
+        throw new Error("Failed to import ciao. Install '@homebridge/ciao' or 'ciao'.")
+      }
+    }
+
+    const responderFactory =
+      ciaoModule.getResponder || ciaoModule.default?.getResponder || ciaoModule.default
+
+    if (typeof responderFactory !== 'function') {
+      throw new Error('ciao.getResponder not found in imported module')
+    }
+
+    const responder = responderFactory()
+    const service = responder.createService({
+      domain: 'local',
+      name,
+      port,
+      protocol: 'tcp',
+      type: 'comapeo',
+    })
+
+    _discoveryResponder = responder
+    _discoveryService = service
+
+    if (typeof service.advertise === 'function') {
+      await service.advertise()
+    } else if (typeof service.start === 'function') {
+      await service.start()
+    }
+
+    console.log('📢 Advertised mDNS service comapeo on', { name, port })
+  } catch (e) {
+    console.warn('⚠️ Failed to start/advertise local discovery:', e?.message || e)
+  }
+}
+
+async function stopPeerDiscoveryAndAdvertise(wrapperManager) {
+  try {
+    try {
+      const coreManager = wrapperManager?.getMapeo?.()
+      if (coreManager && typeof coreManager.stopLocalPeerDiscoveryServer === 'function') {
+        await coreManager.stopLocalPeerDiscoveryServer().catch(() => {})
+      }
+    } catch (ignore) {}
+
+    if (_discoveryResponder) {
+      if (typeof _discoveryResponder.shutdown === 'function') {
+        await _discoveryResponder.shutdown()
+      } else if (typeof _discoveryResponder.close === 'function') {
+        await _discoveryResponder.close()
+      }
+      console.log('✅ mDNS responder shutdown')
+      _discoveryResponder = null
+      _discoveryService = null
+      _lastDiscoveryInfo = null
+    }
+  } catch (e) {
+    console.warn('Error shutting down mDNS responder:', e?.message || e)
+  }
+}
+
+// Basic endpoints available even before mapeoManager ready
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -47,118 +132,140 @@ app.get('/health', (req, res) => {
   })
 })
 
-// API Documentation endpoint
 app.get('/api/docs', (req, res) => {
   res.json({
     title: 'CoMapeo Headless API',
     version: '1.0.0',
     description: 'Complete REST API for CoMapeo headless server',
     baseUrl: `http://localhost:${PORT}/api`,
-    endpoints: {
-      projects: {
-        'GET /projects': 'List all projects',
-        'POST /projects': 'Create new project',
-        'GET /projects/:projectId': 'Get project details',
-        'DELETE /projects/:projectId': 'Delete project',
-        'GET /projects/:projectId/members': 'List project members',
-        'GET /projects/:projectId/config': 'Get project configuration'
-      },
-      observations: {
-        'GET /observations/project/:projectId': 'List observations',
-        'POST /observations/project/:projectId': 'Create observation',
-        'GET /observations/project/:projectId/:observationId': 'Get observation',
-        'PUT /observations/project/:projectId/:observationId': 'Update observation',
-        'DELETE /observations/project/:projectId/:observationId': 'Delete observation'
-      },
-      sync: {
-        'GET /sync/status/:projectId': 'Get sync status',
-        'POST /sync/:projectId/enable': 'Enable sync',
-        'POST /sync/:projectId/disable': 'Disable sync',
-        'POST /sync/:projectId/wait': 'Wait for sync completion'
-      },
-      peers: {
-        'GET /peers/list': 'List local peers',
-        'POST /peers/discovery/start': 'Start peer discovery',
-        'POST /peers/discovery/stop': 'Stop peer discovery',
-        'POST /peers/connect': 'Connect to peer'
-      },
-      members: {
-        'GET /members/project/:projectId': 'List project members',
-        'POST /members/project/:projectId/invite': 'Invite member',
-        'GET /members/project/:projectId/roles': 'Get available roles'
-      },
-      blobs: {
-        'POST /blobs/project/:projectId': 'Upload blob/attachment',
-        'GET /blobs/project/:projectId/:blobId': 'Download blob',
-        'DELETE /blobs/project/:projectId/:blobId': 'Delete blob'
-      },
-      invites: {
-        'GET /invites': 'List pending invites',
-        'POST /invites/:inviteId/accept': 'Accept invite',
-        'POST /invites/:inviteId/reject': 'Reject invite'
-      },
-      status: {
-        'GET /status': 'Get server status',
-        'GET /status/device': 'Get device info',
-        'POST /status/device': 'Update device info'
-      }
-    }
   })
 })
 
-// Middleware para verificar se Mapeo está inicializado
-const checkMapeoInitialized = (req, res, next) => {
-  if (!mapeoManager) {
-    return res.status(503).json({
-      error: 'Service Unavailable',
-      message: 'Mapeo is still initializing. Try again in a moment.',
-      timestamp: new Date().toISOString()
-    })
+// --- Inline debug routes (robust) ---
+// raw invites (existing)
+app.get('/api/debug/invites', async (req, res) => {
+  try {
+    if (!mapeoManager) return res.status(503).json({ success: false, message: 'Mapeo manager not initialized' })
+    let core
+    try { core = mapeoManager.getMapeo() } catch (e) { core = null }
+    if (!core || !core.invite || typeof core.invite.getMany !== 'function') {
+      return res.status(503).json({ success: false, message: 'Invite API not ready' })
+    }
+    const invites = core.invite.getMany() || []
+    return res.json({ success: true, data: invites, count: invites.length })
+  } catch (err) {
+    console.error('Debug invites GET error:', err)
+    return res.status(500).json({ success: false, message: 'Internal error' })
   }
-  next()
+})
+
+// process pending invites one-shot
+app.post('/api/debug/invites/process', async (req, res) => {
+  try {
+    if (!mapeoManager) return res.status(503).json({ success: false, message: 'Mapeo manager not initialized' })
+    let core
+    try { core = mapeoManager.getMapeo() } catch (e) { core = null }
+    if (!core || !core.invite || typeof core.invite.getMany !== 'function' || typeof core.invite.accept !== 'function') {
+      return res.status(503).json({ success: false, message: 'Invite API not ready or not writable' })
+    }
+    const invites = core.invite.getMany() || []
+    const results = []
+    for (const inv of invites) {
+      const id = inv?.inviteId || '<unknown>'
+      if (!inv || inv.state !== 'pending') {
+        results.push({ inviteId: id, status: 'skipped', reason: `state=${inv?.state}` })
+        continue
+      }
+      try {
+        const projectId = await core.invite.accept(inv)
+        console.log(`DEBUG: accepted invite ${id} -> ${projectId}`)
+        // try enable sync
+        try {
+          const project = await mapeoManager.getProject(projectId)
+          if (project && project.sync && typeof project.sync.enableSync === 'function') {
+            await project.sync.enableSync().catch(() => {})
+          }
+        } catch (e) {
+          console.warn('DEBUG: enabling sync after accept failed:', e?.message || e)
+        }
+        results.push({ inviteId: id, status: 'accepted', projectId })
+      } catch (e) {
+        console.warn('DEBUG: accept failed for', id, e?.message || e)
+        results.push({ inviteId: id, status: 'error', reason: e?.message || String(e) })
+      }
+    }
+    return res.json({ success: true, results })
+  } catch (err) {
+    console.error('Debug invites PROCESS error:', err)
+    return res.status(500).json({ success: false, message: 'Internal error' })
+  }
+})
+
+// list local peers detected by core
+app.get('/api/debug/peers', async (req, res) => {
+  try {
+    if (!mapeoManager) return res.status(503).json({ success: false, message: 'Mapeo manager not initialized' })
+    let core
+    try { core = mapeoManager.getMapeo() } catch (e) { core = null }
+    if (!core || typeof core.listLocalPeers !== 'function') {
+      return res.status(503).json({ success: false, message: 'Local peers API not ready' })
+    }
+    const peers = await core.listLocalPeers()
+    return res.json({ success: true, data: peers, count: peers.length })
+  } catch (err) {
+    console.error('Debug peers GET error:', err)
+    return res.status(500).json({ success: false, message: 'Internal error' })
+  }
+})
+
+// core status: fastify address, discovery advertised
+app.get('/api/debug/core', async (req, res) => {
+  try {
+    const fastifyAddress = (mapeoManager && typeof mapeoManager._fastifyAddress !== 'undefined') ? mapeoManager._fastifyAddress : null
+    return res.json({
+      success: true,
+      coreHttpBase: fastifyAddress,
+      discoveryAdvertised: !!_discoveryService,
+      lastDiscoveryInfo: _lastDiscoveryInfo || null,
+    })
+  } catch (err) {
+    console.error('Debug core GET error:', err)
+    return res.status(500).json({ success: false, message: 'Internal error' })
+  }
+})
+// --- end inline debug routes ---
+
+// Mount routers after initialization (so they can receive mapeoManager)
+function mountApiRoutes(manager) {
+  const checkMapeoInitialized = (req, res, next) => {
+    if (!manager) {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        message: 'Mapeo is still initializing. Try again in a moment.',
+        timestamp: new Date().toISOString()
+      })
+    }
+    next()
+  }
+
+  app.use('/api/projects', checkMapeoInitialized, projectRoutes(manager))
+  app.use('/api/sync', checkMapeoInitialized, syncRoutes(manager))
+  app.use('/api/observations', checkMapeoInitialized, observationsRoutes(manager))
+  app.use('/api/status', checkMapeoInitialized, statusRoutes(manager))
+  app.use('/api/peers', checkMapeoInitialized, peersRoutes(manager))
+  app.use('/api/members', checkMapeoInitialized, membersRoutes(manager))
+  app.use('/api/blobs', checkMapeoInitialized, blobsRoutes(manager))
+  app.use('/api/invites', checkMapeoInitialized, invitesRoutes(manager))
 }
-
-// API Routes - passar mapeoManager como callback
-app.use('/api/projects', checkMapeoInitialized, (req, res, next) => {
-  projectRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/sync', checkMapeoInitialized, (req, res, next) => {
-  syncRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/observations', checkMapeoInitialized, (req, res, next) => {
-  observationsRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/status', checkMapeoInitialized, (req, res, next) => {
-  statusRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/peers', checkMapeoInitialized, (req, res, next) => {
-  peersRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/members', checkMapeoInitialized, (req, res, next) => {
-  membersRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/blobs', checkMapeoInitialized, (req, res, next) => {
-  blobsRoutes(mapeoManager)(req, res, next)
-})
-
-app.use('/api/invites', checkMapeoInitialized, (req, res, next) => {
-  invitesRoutes(mapeoManager)(req, res, next)
-})
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Error:', err.message)
-  res.status(err.status || 500).json({
-    error: err.error || 'Internal Server Error',
-    message: err.message,
+  console.error('Error:', err?.message || err)
+  res.status(err?.status || 500).json({
+    error: err?.error || 'Internal Server Error',
+    message: err?.message || String(err),
     timestamp: new Date().toISOString(),
-    details: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    details: process.env.NODE_ENV === 'development' ? err?.stack : undefined
   })
 })
 
@@ -177,12 +284,21 @@ async function start() {
     console.log('🚀 Initializing CoMapeo Headless Server...')
     console.log(`📁 Data directory: ${DATA_DIR}`)
 
+    // initialize wrapper manager
     mapeoManager = new MapeoManager(DATA_DIR, DEVICE_NAME)
     const initResult = await mapeoManager.initialize()
 
     console.log('✅ CoMapeo initialized successfully')
     console.log(`🔐 Device ID: ${initResult.deviceId}`)
     console.log(`🖥️  Device: ${initResult.deviceName}`)
+
+    // mount API routes now that manager exists
+    mountApiRoutes(mapeoManager)
+
+    // Start and advertise local discovery (mDNS). Don't block server start if this fails.
+    startPeerDiscoveryAndAdvertise(mapeoManager).catch((e) => {
+      console.warn('Failed to start peer discovery:', e?.message || e)
+    })
 
     const server = app.listen(PORT, () => {
       console.log(`
@@ -203,12 +319,18 @@ async function start() {
     const shutdown = async () => {
       console.log('\n⏹️  Shutting down gracefully...')
       server.close(async () => {
-        await mapeoManager.close()
+        await stopPeerDiscoveryAndAdvertise(mapeoManager).catch((e) => {
+          console.warn('Error stopping discovery:', e?.message || e)
+        })
+        if (mapeoManager) {
+          await mapeoManager.close().catch((e) => {
+            console.warn('Error closing mapeoManager:', e?.message || e)
+          })
+        }
         console.log('✅ Server closed')
         process.exit(0)
       })
 
-      // Force shutdown after 10 seconds
       setTimeout(() => {
         console.error('⚠️  Forced shutdown after timeout')
         process.exit(1)
@@ -218,8 +340,8 @@ async function start() {
     process.on('SIGINT', shutdown)
     process.on('SIGTERM', shutdown)
   } catch (error) {
-    console.error('❌ Failed to initialize CoMapeo:', error.message)
-    console.error('Stack trace:', error.stack)
+    console.error('��� Failed to initialize CoMapeo:', error?.message || error)
+    console.error('Stack trace:', error?.stack || '')
     process.exit(1)
   }
 }
