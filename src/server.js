@@ -155,25 +155,51 @@ app.get('/__whoami', (req, res) => {
   })
 })
 
+
+
+function describeStack(app) {
+  const out = []
+  const stack = app?._router?.stack || []
+
+  for (const layer of stack) {
+    // direct route
+    if (layer?.route?.path) {
+      const methods = Object.keys(layer.route.methods || {}).filter((m) => layer.route.methods[m])
+      out.push({ type: 'route', path: layer.route.path, methods })
+      continue
+    }
+
+    // mounted router middleware
+    if (layer?.name === 'router' && layer?.handle?.stack) {
+      // Express stores mount path in layer.regexp + layer.keys; we can approximate a readable prefix:
+      const keys = layer?.keys || []
+      const keyNames = keys.map((k) => k?.name).filter(Boolean)
+
+      out.push({
+        type: 'router',
+        // regexp is ugly but helps confirm the mount prefix exists
+        regexp: String(layer.regexp),
+        keys: keyNames,
+        // also list first few inner routes (paths only)
+        inner: (layer.handle.stack || [])
+          .filter((l) => l?.route?.path)
+          .slice(0, 20)
+          .map((l) => ({ path: l.route.path, methods: Object.keys(l.route.methods || {}).filter((m) => l.route.methods[m]) })),
+      })
+    }
+  }
+  return out
+}
+
 // Lista as rotas que o Express conhece (debug)
 app.get('/__routes', (req, res) => {
   try {
-    const routes = []
-    const stack = app?._router?.stack || []
-    for (const layer of stack) {
-      if (layer?.route?.path) {
-        const methods = Object.keys(layer.route.methods || {}).filter((m) => layer.route.methods[m])
-        routes.push({ path: layer.route.path, methods })
-      } else if (layer?.name === 'router' && layer?.handle?.stack) {
-        // mounted routers: show mount path if available
-        routes.push({ mounted: true, name: layer.name })
-      }
-    }
-    res.json({ ok: true, routes })
+    res.json({ ok: true, routes: describeStack(app) })
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) })
   }
 })
+
 
 
 // --- Inline debug routes (robust) ---
@@ -282,7 +308,8 @@ function mountApiRoutes(manager) {
     }
     next()
   }
-
+    
+  console.log('MOUNTING API ROUTES: auto-connect + debug-sync should be available now')
   app.use('/api/projects', checkMapeoInitialized, projectRoutes(manager))
   app.use('/api/sync', checkMapeoInitialized, syncRoutes(manager))
   app.use('/api/observations', checkMapeoInitialized, observationsRoutes(manager))

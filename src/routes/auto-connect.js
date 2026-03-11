@@ -3,6 +3,11 @@ import express from 'express'
 export function autoConnectRoutes(mapeoManager) {
   const router = express.Router()
 
+  // Simple ping to confirm router is mounted
+  router.get('/ping', (req, res) => {
+    res.json({ success: true, message: 'auto-connect router mounted', timestamp: new Date().toISOString() })
+  })
+
   router.post('/connect', async (req, res, next) => {
     try {
       const { deviceId } = req.body || {}
